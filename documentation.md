@@ -7,6 +7,10 @@ es lo mínimo para levantarlas con Docker y entrar por primera vez.
 > —Cloud SQL, los dos servicios en Cloud Run y la comprobación final—. Abre Cloud Shell en tu
 > proyecto y ejecuta `TAG=v0.1.0 bash gcp.sh`. Es re-ejecutable para actualizar de versión.
 
+
+Puedes usar el siguiente comando en GCP:
+> wget https://raw.githubusercontent.com/.../gcp.sh && chmod +x gcp.sh && ./gcp.sh
+
 ## 1. Antes de empezar
 
 Necesitas Docker y tu token de Quay (el mismo sirve para `core` y para `ui`).

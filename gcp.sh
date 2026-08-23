@@ -9,6 +9,7 @@
 #   bash gcp.sh                      # tags :latest
 #   TAG=v0.1.0 bash gcp.sh           # una versión concreta (recomendado)
 #   REGION=europe-southwest1 bash gcp.sh
+#   DEBUG=1 bash gcp.sh              # diagnóstico de red y crane en verbose
 set -euo pipefail
 
 # //// CONFIGURACIÓN \\\\
@@ -33,6 +34,79 @@ AR_HOST="${REGION}-docker.pkg.dev"
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+
+# Sufijo de asset de los releases de go-containerregistry para esta máquina:
+# goreleaser los nombra Linux_x86_64, Darwin_arm64, etc.
+crane_asset() {
+    local os arch
+    case "$(uname -s)" in
+        Linux)  os=Linux  ;;
+        Darwin) os=Darwin ;;
+        *) return 1 ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)  arch=x86_64 ;;
+        aarch64|arm64) arch=arm64  ;;
+        *) return 1 ;;
+    esac
+    printf '%s_%s' "$os" "$arch"
+}
+
+# Deja en $CRANE la ruta a un crane utilizable. Devuelve no-cero SIN abortar: el
+# paso de copia tiene reserva con docker para una máquina sin salida a github.com.
+CRANE=""
+CRANE_DIR="${HOME}/.axium/bin"
+ensure_crane() {
+    [[ -z "${AXIUM_NO_CRANE:-}" ]] || return 1
+    if command -v crane >/dev/null 2>&1; then CRANE="$(command -v crane)"; return 0; fi
+    if [[ -x "${CRANE_DIR}/crane" ]]; then CRANE="${CRANE_DIR}/crane"; return 0; fi
+
+    local asset url
+    asset="$(crane_asset)" || return 1
+    mkdir -p "$CRANE_DIR" || return 1
+    # Se descubre la URL en vez de construirla: el nombre del asset lo decide
+    # goreleaser y no conviene fijar una versión concreta a mano.
+    url="$(curl -fsS --max-time 30 \
+        https://api.github.com/repos/google/go-containerregistry/releases/latest \
+        | grep -o "https://[^\"]*${asset}\.tar\.gz" | head -1)" || return 1
+    [[ -n "$url" ]] || return 1
+    curl -fsSL --max-time 180 "$url" | tar -xz -C "$CRANE_DIR" crane || return 1
+    chmod +x "${CRANE_DIR}/crane" || return 1
+    CRANE="${CRANE_DIR}/crane"
+}
+
+# Todo lo que hace falta para entender por qué no se puede escribir en Artifact
+# Registry. Se llama al fallar una copia, y con DEBUG=1 también al principio.
+# El caso que motiva esto: el daemon de Docker de Cloud Shell devolviendo
+# 'connection refused' contra un endpoint al que curl llega sin problema desde el
+# mismo shell.
+diagnose_registry() {
+    local ips code
+    log "Diagnóstico de conectividad con Artifact Registry"
+    # python3 y no getent: getent no existe en macOS y un 'NO RESUELVE' falso es
+    # justo el tipo de pista engañosa que este bloque intenta evitar.
+    ips="$(python3 -c "
+import socket, sys
+try:
+    print(' '.join(sorted({i[4][0] for i in socket.getaddrinfo(sys.argv[1], 443)})))
+except Exception:
+    pass
+" "$AR_HOST" 2>/dev/null || true)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://${AR_HOST}/v2/" 2>/dev/null || echo 000)"
+    info "host:   $AR_HOST"
+    info "dns:    ${ips:-NO RESUELVE}"
+    info "curl:   https://${AR_HOST}/v2/ -> HTTP ${code}  (401 es la respuesta correcta)"
+    info "crane:  ${CRANE:-no disponible}"
+    info "docker: $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo 'daemon no disponible')"
+    docker info 2>/dev/null | grep -i 'proxy' | sed 's/^/    docker: /' || true
+    if [[ "$code" == "401" ]]; then
+        info ""
+        info "El shell SÍ llega al registry, así que la red de esta máquina está bien."
+        info "Si la copia ha fallado con 'connection refused', el problema es el"
+        info "daemon de Docker de aquí. Reinícialo y vuelve a lanzar el script:"
+        info "  sudo systemctl restart docker"
+    fi
+}
 
 # Lee una variable de entorno de un servicio de Cloud Run ya desplegado. Es lo
 # que hace idempotente al script: sin Secret Manager, la configuración del
@@ -79,26 +153,89 @@ gcloud auth configure-docker "$AR_HOST" --quiet
 
 # //// 2. COPIAR LAS IMÁGENES DE QUAY \\\\
 # Cloud Run solo despliega desde Artifact Registry: no puede tirar de quay.io ni
-# de ningún otro registry de terceros. Por eso hay que copiarlas. Cloud Shell es
-# amd64, que es lo que ejecuta Cloud Run, así que la copia de una sola
-# arquitectura es suficiente.
+# de ningún otro registry de terceros. Por eso hay que copiarlas.
+#
+# La copia la hace crane y no docker, y no es un capricho: el daemon de Docker de
+# Cloud Shell no siempre consigue abrir una conexión contra *.pkg.dev y muere con
+# 'connection refused' contra un endpoint al que curl llega sin problema desde el
+# mismo shell. crane habla el protocolo de registry desde el propio proceso, así
+# que no depende del daemon. De propina va por streaming —no deja 1 GB de
+# imágenes en el disco efímero de la VM— y copia el índice multiarquitectura tal
+# cual, que Cloud Run resuelve a linux/amd64 él solo.
+#
+# Si crane no se puede descargar (una máquina sin salida a github.com) queda la
+# reserva con docker, que es lo que hacía este script antes.
 log "Copiando las imágenes de Quay a Artifact Registry"
-if grep -q 'quay\.io' "${HOME}/.docker/config.json" 2>/dev/null; then
-    info "ya hay sesión iniciada en quay.io"
+if ensure_crane; then
+    info "usando crane: $CRANE"
 else
-    info "Introduce tu usuario y token de Quay (el mismo sirve para core y ui):"
-    docker login quay.io
+    info "crane no está disponible, uso el daemon de Docker como reserva"
 fi
 
 CORE_IMAGE="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/core:${TAG}"
 UI_IMAGE="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/ui:${TAG}"
 
+[[ -z "${DEBUG:-}" ]] || diagnose_registry
+
+quay_login() {
+    local user token
+    info "Introduce tu usuario y token de Quay (el mismo sirve para core y ui):"
+    read -rp  "    Usuario: " user
+    read -rsp "    Token:   " token; printf '\n'
+    # --password-stdin para que el token no acabe en la línea de comandos.
+    if [[ -n "$CRANE" ]]; then
+        printf '%s' "$token" | "$CRANE" auth login quay.io -u "$user" --password-stdin
+    else
+        printf '%s' "$token" | docker login quay.io -u "$user" --password-stdin
+    fi
+}
+
+# Con crane se comprueba el acceso leyendo un manifest de verdad, en lugar de
+# adivinarlo mirando si hay una entrada en ~/.docker/config.json.
+if [[ -n "$CRANE" ]]; then
+    if "$CRANE" manifest "${QUAY_CORE}:${TAG}" >/dev/null 2>&1; then
+        info "ya hay acceso a quay.io"
+    else
+        quay_login
+    fi
+elif grep -q 'quay\.io' "${HOME}/.docker/config.json" 2>/dev/null; then
+    info "ya hay sesión iniciada en quay.io"
+else
+    quay_login
+fi
+
+# Un fallo contra un registry es a menudo transitorio, y hasta ahora cualquiera
+# de ellos mataba el script entero.
+copy_image() {
+    local src="$1" dst="$2" attempt
+    if [[ -n "$CRANE" ]]; then
+        for attempt in 1 2 3; do
+            if "$CRANE" ${DEBUG:+--verbose} copy "$src" "$dst"; then
+                return 0
+            fi
+            if (( attempt < 3 )); then
+                info "el intento $attempt de 3 ha fallado, reintento en $((attempt * 5))s"
+                sleep $((attempt * 5))
+            fi
+        done
+        info "crane no ha podido copiar, pruebo con el daemon de Docker"
+    fi
+    docker pull --platform linux/amd64 "$src" \
+        && docker tag "$src" "$dst" \
+        && docker push "$dst"
+}
+
 for pair in "${QUAY_CORE}:${TAG} ${CORE_IMAGE}" "${QUAY_UI}:${TAG} ${UI_IMAGE}"; do
     read -r src dst <<<"$pair"
     info "$src -> $dst"
-    docker pull --platform linux/amd64 "$src"
-    docker tag "$src" "$dst"
-    docker push "$dst"
+    if ! copy_image "$src" "$dst"; then
+        diagnose_registry
+        die "No se pudo copiar $src a Artifact Registry.
+    Mira el diagnóstico de aquí arriba: si el curl responde 401, la red está bien
+    y el problema es local a esta máquina. Con DEBUG=1 el script imprime esto
+    mismo antes de empezar y pone a crane en verbose:
+      DEBUG=1 TAG=${TAG} bash gcp.sh"
+    fi
 done
 
 # //// 3. CLOUD SQL \\\\
