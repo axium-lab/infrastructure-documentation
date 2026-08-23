@@ -9,7 +9,7 @@ es lo mínimo para levantarlas con Docker y entrar por primera vez.
 
 
 Puedes usar el siguiente comando en GCP:
-> wget https://raw.githubusercontent.com/.../gcp.sh && chmod +x gcp.sh && ./gcp.sh
+> wget https://raw.githubusercontent.com/axium-lab/infrastructure-documentation/refs/heads/main/gcp.sh && chmod +x gcp.sh && ./gcp.sh
 
 ## 1. Antes de empezar
 
