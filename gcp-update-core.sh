@@ -130,7 +130,7 @@ info "el repositorio '$AR_REPO' existe"
 
 gcloud auth configure-docker "$AR_HOST" --quiet
 
-# //// 2. COPIAR LA IMAGEN DEL CORE \\\\
+# //// 2. TRAER LA IMAGEN DEL CORE DE QUAY \\\\
 # Cloud Run solo despliega desde Artifact Registry: no puede tirar de quay.io ni
 # de ningún otro registry de terceros. Por eso hay que copiarla.
 #
@@ -144,14 +144,14 @@ gcloud auth configure-docker "$AR_HOST" --quiet
 #
 # Si crane no se puede descargar (una máquina sin salida a github.com) queda la
 # reserva con docker.
-log "Copiando la imagen del core de Quay a Artifact Registry"
+log "Trayendo la imagen del core de Quay"
 if ensure_crane; then
     info "usando crane: $CRANE"
 else
     info "crane no está disponible, uso el daemon de Docker como reserva"
 fi
 
-CORE_IMAGE="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/core:${TAG}"
+AR_CORE="${AR_HOST}/${PROJECT_ID}/${AR_REPO}/core"
 
 [[ -z "${DEBUG:-}" ]] || diagnose_registry
 
@@ -182,12 +182,29 @@ else
     quay_login
 fi
 
+# Digest de la imagen en Artifact Registry una vez copiada. Es lo que se
+# despliega: fijarlo aquí es lo que garantiza que a Cloud Run llega la imagen que
+# quay.io tiene AHORA y no la que resolviera un :latest cinco minutos después.
+CORE_DIGEST=""
+
 # Un fallo contra un registry es a menudo transitorio, y sin esto cualquiera de
 # ellos mataría el script entero.
-copy_image() {
-    local src="$1" dst="$2" attempt
+copy_core() {
+    local dst src attempt logfile
+    dst="${AR_CORE}:${TAG}"
+
     if [[ -n "$CRANE" ]]; then
+        # Se resuelve el digest del origen ANTES de copiar y se copia por digest:
+        # con :latest el tag se mueve, y entre el 'crane copy' y el 'gcloud run
+        # deploy' podría publicarse otra imagen. Copiando y desplegando el mismo
+        # sha256 no hay ventana. crane no recomprime nada, así que el digest en
+        # destino es idéntico al de quay.
+        CORE_DIGEST="$("$CRANE" digest "${QUAY_CORE}:${TAG}")" || return 1
+        src="${QUAY_CORE}@${CORE_DIGEST}"
+        info "quay.io tiene ${TAG} -> ${CORE_DIGEST}"
         for attempt in 1 2 3; do
+            # El destino lleva el tag para que siga siendo legible en la consola
+            # de Artifact Registry; el despliegue va por digest de todas formas.
             if "$CRANE" ${DEBUG:+--verbose} copy "$src" "$dst"; then
                 return 0
             fi
@@ -198,20 +215,34 @@ copy_image() {
         done
         info "crane no ha podido copiar, pruebo con el daemon de Docker"
     fi
-    docker pull --platform linux/amd64 "$src" \
-        && docker tag "$src" "$dst" \
-        && docker push "$dst"
+
+    # docker no sabe copiar un índice multiarquitectura: baja la variante amd64 y
+    # sube solo esa, así que el digest de destino NO es el de quay y hay que
+    # sacarlo de la propia subida. El rmi previo es para que el pull sea una
+    # descarga de verdad y no un acierto de caché local.
+    docker rmi -f "${QUAY_CORE}:${TAG}" >/dev/null 2>&1 || true
+    docker pull --platform linux/amd64 "${QUAY_CORE}:${TAG}" || return 1
+    docker tag "${QUAY_CORE}:${TAG}" "$dst" || return 1
+
+    logfile="$(mktemp)"
+    docker push "$dst" | tee "$logfile" || { rm -f "$logfile"; return 1; }
+    CORE_DIGEST="$(grep -o 'sha256:[0-9a-f]\{64\}' "$logfile" | tail -1)"
+    rm -f "$logfile"
+    [[ -n "$CORE_DIGEST" ]] || return 1
 }
 
-info "${QUAY_CORE}:${TAG} -> ${CORE_IMAGE}"
-if ! copy_image "${QUAY_CORE}:${TAG}" "$CORE_IMAGE"; then
+info "${QUAY_CORE}:${TAG} -> ${AR_CORE}:${TAG}"
+if ! copy_core; then
     diagnose_registry
-    die "No se pudo copiar ${QUAY_CORE}:${TAG} a Artifact Registry.
+    die "No se pudo traer ${QUAY_CORE}:${TAG} a Artifact Registry.
     Mira el diagnóstico de aquí arriba: si el curl responde 401, la red está bien
     y el problema es local a esta máquina. Con DEBUG=1 el script imprime esto
     mismo antes de empezar y pone a crane en verbose:
       DEBUG=1 TAG=${TAG} bash gcp-update-core.sh"
 fi
+
+CORE_IMAGE="${AR_CORE}@${CORE_DIGEST}"
+info "imagen a desplegar: $CORE_IMAGE"
 
 # //// 3. REDESPLEGAR EL CORE \\\\
 # Solo --image, a propósito. Un 'gcloud run deploy' sobre un servicio que ya
@@ -264,7 +295,8 @@ cat <<RESUMEN
 
 $(printf '\033[1;32m')Core actualizado a ${TAG}.$(printf '\033[0m')
 
-  API:  $CORE_URL/v1
+  API:     $CORE_URL/v1
+  Imagen:  ${CORE_DIGEST}
 
 La ui no se ha tocado: sigue apuntando a esta misma URL, que no cambia entre
 despliegues. Si también quieres actualizarla, ejecuta el instalador completo:
