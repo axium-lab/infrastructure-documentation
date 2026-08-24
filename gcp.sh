@@ -10,6 +10,7 @@
 #   TAG=v0.1.0 bash gcp.sh           # una versión concreta (recomendado)
 #   REGION=europe-southwest1 bash gcp.sh
 #   DEBUG=1 bash gcp.sh              # diagnóstico de red y crane en verbose
+#   VERTEX_PROJECT=otro bash gcp.sh  # si Vertex AI vive en otro proyecto
 set -euo pipefail
 
 # //// CONFIGURACIÓN \\\\
@@ -26,6 +27,13 @@ AR_REPO="${AR_REPO:-axium}"
 CORE_SERVICE="${CORE_SERVICE:-axium-core}"
 UI_SERVICE="${UI_SERVICE:-axium-ui}"
 
+# Proyecto donde vive Vertex AI. Por defecto el mismo del despliegue, que es el
+# caso normal. Se separa porque el core llama a Vertex con el project_id que
+# tenga configurado el proveedor DENTRO de Axium, y ese puede ser otro: el rol
+# va siempre en el proyecto de Vertex, con la SA del core como member.
+#   VERTEX_PROJECT=otro-proyecto bash gcp.sh
+VERTEX_PROJECT="${VERTEX_PROJECT:-$PROJECT_ID}"
+
 QUAY_CORE="quay.io/axiumlab/core"
 QUAY_UI="quay.io/axiumlab/ui"
 AR_HOST="${REGION}-docker.pkg.dev"
@@ -34,6 +42,7 @@ AR_HOST="${REGION}-docker.pkg.dev"
 log()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
+warn() { printf '\n\033[1;33mAVISO: %s\033[0m\n' "$*" >&2; }
 
 # Sufijo de asset de los releases de go-containerregistry para esta máquina:
 # goreleaser los nombra Linux_x86_64, Darwin_arm64, etc.
@@ -125,12 +134,24 @@ print(next((e.get('value', '') for e in (c[0].get('env') or []) if e.get('name')
 " 2>/dev/null || true
 }
 
+# La service account con la que corre un servicio de Cloud Run ya desplegado.
+# Sale vacío si el servicio no existe todavía o si se desplegó sin
+# --service-account, que es lo que hace este script: en ese caso Cloud Run usa
+# la SA de compute por defecto. Se lee de vuelta por lo mismo que read_env: si
+# alguien la cambió a mano, los permisos tienen que ir a LA SUYA y no a la que
+# el script supone.
+read_sa() {
+    gcloud run services describe "$1" --project "$PROJECT_ID" --region "$REGION" \
+        --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true
+}
+
 [[ -n "$PROJECT_ID" ]] || die "No hay proyecto configurado. Ejecuta: gcloud config set project TU_PROYECTO"
 
 log "Axium en GCP"
 info "proyecto: $PROJECT_ID"
 info "región:   $REGION"
 info "versión:  $TAG"
+[[ "$VERTEX_PROJECT" != "$PROJECT_ID" ]] && info "vertex:   $VERTEX_PROJECT"
 
 # //// 1. APIS Y ARTIFACT REGISTRY \\\\
 log "Habilitando APIs (puede tardar un minuto)"
@@ -139,6 +160,16 @@ gcloud services enable \
     run.googleapis.com \
     artifactregistry.googleapis.com \
     --project "$PROJECT_ID"
+
+# Vertex AI: el core la llama en caliente para generar con los modelos de
+# Google. Va aparte porque puede vivir en otro proyecto, y no aborta el script
+# si falla: sin ella se instala igual, solo que los modelos de Google no
+# responden hasta que alguien la habilite.
+if ! gcloud services enable aiplatform.googleapis.com --project "$VERTEX_PROJECT" 2>/dev/null; then
+    warn "no se ha podido habilitar aiplatform.googleapis.com en '$VERTEX_PROJECT'.
+    Los modelos de Google (Gemini) fallarán hasta que se habilite:
+      gcloud services enable aiplatform.googleapis.com --project $VERTEX_PROJECT"
+fi
 
 log "Artifact Registry"
 if gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" --project "$PROJECT_ID" >/dev/null 2>&1; then
@@ -310,12 +341,51 @@ fi
 # //// 5. PERMISOS \\\\
 log "Permisos del service account de ejecución"
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
-RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+# Si el core ya está desplegado con una SA propia, los permisos van a esa. Si
+# no, a la de compute por defecto, que es la que le pondrá el deploy de abajo.
+RUNTIME_SA="$(read_sa "$CORE_SERVICE")"
+RUNTIME_SA="${RUNTIME_SA:-$DEFAULT_SA}"
+info "service account: $RUNTIME_SA"
+
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:${RUNTIME_SA}" \
     --role="roles/cloudsql.client" \
     --condition=None >/dev/null
-info "$RUNTIME_SA -> roles/cloudsql.client"
+info "$RUNTIME_SA -> roles/cloudsql.client (en $PROJECT_ID)"
+
+# Vertex AI. Sin esto el despliegue va bien y es al usar un modelo de Google
+# cuando salta el 403:
+#
+#   Permission 'aiplatform.endpoints.predict' denied on resource
+#   '//aiplatform.googleapis.com/projects/.../publishers/google/models/...'
+#   reason: IAM_PERMISSION_DENIED
+#
+# El core no invoca nada dentro del proyecto: hace una llamada SALIENTE a la API
+# de Vertex con un access token OAuth2 (scope cloud-platform) que pide al
+# metadata server de la instancia. Los scopes no hay que tocarlos, en Cloud Run
+# el metadata server ya emite con cloud-platform: lo único que falta es el rol.
+#
+# El binding es A NIVEL DE PROYECTO a propósito. Los publisher models
+# (publishers/google/models/...) no admiten política de IAM por recurso, así que
+# no se puede acotar más por aquí.
+if gcloud projects add-iam-policy-binding "$VERTEX_PROJECT" \
+    --member="serviceAccount:${RUNTIME_SA}" \
+    --role="roles/aiplatform.user" \
+    --condition=None >/dev/null 2>&1; then
+    info "$RUNTIME_SA -> roles/aiplatform.user (en $VERTEX_PROJECT)"
+else
+    # Falla típicamente cuando VERTEX_PROJECT es otro proyecto y quien ejecuta
+    # el script no manda en él. No se aborta: el resto de la instalación es
+    # buena, y esto es un binding que puede dar el administrador después.
+    warn "no se ha podido dar roles/aiplatform.user en el proyecto '$VERTEX_PROJECT'.
+    Los modelos de Google (Gemini) responderán 403 PERMISSION_DENIED hasta que
+    alguien con permisos de IAM en ese proyecto ejecute:
+
+      gcloud projects add-iam-policy-binding $VERTEX_PROJECT \\
+        --member=\"serviceAccount:${RUNTIME_SA}\" \\
+        --role=roles/aiplatform.user --condition=None"
+fi
 
 # //// 6. DESPLEGAR EL CORE \\\\
 # TRUST_PROXY=true porque Cloud Run termina el TLS por delante y reescribe
@@ -427,6 +497,13 @@ Dos cosas que conviene saber:
 
   - No hay migraciones de esquema. Volver a ejecutar este script con un TAG más
     nuevo actualiza las imágenes, pero no toca un esquema ya instalado.
+
+  - Los modelos de Google (Gemini) ya tienen concedido el permiso de Vertex AI
+    en el proyecto $VERTEX_PROJECT. Si al configurar el proveedor en la consola
+    pones OTRO project_id, hay que volver a lanzar el script apuntando a él o el
+    core responderá 403 PERMISSION_DENIED al generar:
+
+       VERTEX_PROJECT=ese-otro-proyecto bash gcp.sh
 
 Para actualizar:  TAG=v0.2.0 bash gcp.sh
 
