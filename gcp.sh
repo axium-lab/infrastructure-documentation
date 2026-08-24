@@ -398,7 +398,6 @@ if ! gcloud run deploy "$CORE_SERVICE" \
     --image "$CORE_IMAGE" \
     --region "$REGION" \
     --allow-unauthenticated \
-    --member=allUsers \
     --add-cloudsql-instances "$CONN" \
     --set-env-vars "DATABASE_URL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true" \
     --memory 1Gi --cpu 1 --concurrency 20 \
@@ -423,7 +422,6 @@ gcloud run deploy "$UI_SERVICE" \
     --image "$UI_IMAGE" \
     --region "$REGION" \
     --allow-unauthenticated \
-    --member=allUsers \
     --set-env-vars "API_URL=${CORE_URL}/v1" \
     --memory 512Mi --cpu 1 --concurrency 80 \
     --min-instances 0 --max-instances 4
