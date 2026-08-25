@@ -13,6 +13,10 @@ guide is the minimum needed to bring them up with Docker and log in for the firs
 You can use the following command on GCP:
 > wget https://raw.githubusercontent.com/axium-lab/infrastructure-documentation/refs/heads/main/infra-gcp/gcp.sh && chmod +x gcp.sh && ./gcp.sh
 
+Update Axium on GCP:
+> wget https://raw.githubusercontent.com/axium-lab/infrastructure-documentation/refs/heads/main/infra-gcp/update.sh && chmod +x update.sh && ./update.sh
+
+
 ## 1. Before you start
 
 You need Docker and your Quay token (the same one works for both `core` and `ui`).
