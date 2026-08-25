@@ -3,13 +3,13 @@
 Axium is three pieces: **core** (the API), **ui** (the web console) and **PostgreSQL**. This
 guide is the minimum needed to bring them up with Docker and log in for the first time.
 
-> **Installing on Google Cloud?** Don't follow this guide: use `gcp.sh`, which does everything
+> **Installing on Google Cloud?** Don't follow this guide: use `infra-gcp/gcp.sh`, which does everything
 > for you —Cloud SQL, both services on Cloud Run and the final check—. Open Cloud Shell in your
-> project and run `TAG=v0.1.0 bash gcp.sh`. It is re-runnable to upgrade versions.
+> project and run `TAG=v0.1.0 bash infra-gcp/gcp.sh`. It is re-runnable to upgrade versions.
 
 
 You can use the following command on GCP:
-> wget https://raw.githubusercontent.com/axium-lab/infrastructure-documentation/refs/heads/main/gcp.sh && chmod +x gcp.sh && ./gcp.sh
+> wget https://raw.githubusercontent.com/axium-lab/infrastructure-documentation/refs/heads/main/infra-gcp/gcp.sh && chmod +x gcp.sh && ./gcp.sh
 
 ## 1. Before you start
 
