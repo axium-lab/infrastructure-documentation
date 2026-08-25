@@ -5,7 +5,9 @@ guide is the minimum needed to bring them up with Docker and log in for the firs
 
 > **Installing on Google Cloud?** Don't follow this guide: use `infra-gcp/gcp.sh`, which does everything
 > for you —Cloud SQL, both services on Cloud Run and the final check—. Open Cloud Shell in your
-> project and run `TAG=v0.1.0 bash infra-gcp/gcp.sh`. It is re-runnable to upgrade versions.
+> project and run `TAG=v0.1.0 bash infra-gcp/gcp.sh`. It is re-runnable to upgrade versions,
+> and once it is installed `infra-gcp/update.sh` upgrades the core, the ui or both on its own
+> (see [Upgrading](#on-google-cloud)).
 
 
 You can use the following command on GCP:
@@ -143,6 +145,24 @@ docker stop axium-core && docker rm axium-core
 ```
 
 The containers are disposable and the Postgres volume stays where it is. Same for the ui.
+
+### On Google Cloud
+
+Use `infra-gcp/update.sh`. It asks what you want to upgrade —core, ui or both—, copies the
+image from Quay into Artifact Registry and redeploys the Cloud Run services. It only passes
+`--image`, so the database, the master key, the environment variables and the IAM policy stay
+exactly as they were.
+
+```bash
+bash infra-gcp/update.sh                 # asks what to upgrade
+bash infra-gcp/update.sh core            # only the core
+bash infra-gcp/update.sh ui              # only the ui
+TAG=v0.2.0 bash infra-gcp/update.sh both # both, on a specific version (recommended)
+```
+
+It expects an installation that is already running: if a service or the Artifact Registry
+repository is missing, it stops and points you at `infra-gcp/gcp.sh`. Add `DEBUG=1` for
+network diagnostics, and `REGION=` if you did not deploy to `europe-west1`.
 
 ## Three things worth knowing beforehand
 
