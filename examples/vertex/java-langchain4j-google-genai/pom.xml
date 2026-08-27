@@ -1,0 +1,27 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>test</groupId>
+  <artifactId>langchain4j-genai</artifactId>
+  <version>1.0</version>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <exec.mainClass>Main</exec.mainClass>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.langchain4j</groupId>
+      <artifactId>langchain4j-google-genai</artifactId>
+      <version>1.19.0-beta29</version>
+    </dependency>
+    <!-- silencia el warning de SLF4J; cambia a slf4j-simple si quieres ver logs -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-nop</artifactId>
+      <version>2.0.18</version>
+      <scope>runtime</scope>
+    </dependency>
+  </dependencies>
+</project>
