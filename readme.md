@@ -95,6 +95,7 @@ isn't 64 hexadecimal characters— the process refuses to start. Everything else
 | `LOG_REQUESTS`    | off         | `true` for one log line per HTTP request.                           |
 | `PUBLIC_BASE_URL` | —           | Public URL of the core. Only if there is a proxy in front terminating TLS. |
 | `TRUST_PROXY`     | `false`     | `true` if there is a proxy in front terminating TLS.                |
+| `AXIUM_LICENSE`   | —           | Your Axium license, a 40-character hex string. Check it with `curl https://meta.axium-lab.com/v1/license/check/<license>`. `infra-gcp/gcp.sh` asks for it and sets it for you. |
 
 On the first startup the core waits for Postgres (up to 30 seconds), installs the schema
 itself and creates the initial user. Restarting it repeats nothing.

@@ -11,6 +11,7 @@
 #   REGION=europe-southwest1 bash gcp.sh
 #   DEBUG=1 bash gcp.sh              # diagnóstico de red y crane en verbose
 #   VERTEX_PROJECT=otro bash gcp.sh  # si Vertex AI vive en otro proyecto
+#   AXIUM_LICENSE=abc... bash gcp.sh # sin preguntar por la licencia
 set -euo pipefail
 
 # //// CONFIGURACIÓN \\\\
@@ -33,6 +34,14 @@ UI_SERVICE="${UI_SERVICE:-axium-ui}"
 # va siempre en el proyecto de Vertex, con la SA del core como member.
 #   VERTEX_PROJECT=otro-proyecto bash gcp.sh
 VERTEX_PROJECT="${VERTEX_PROJECT:-$PROJECT_ID}"
+
+# Licencia de Axium. Si no viene por entorno se lee del core ya desplegado y, si
+# tampoco, se pregunta. Se comprueba contra la API de Axium Lab ANTES de tocar
+# nada: vale más enterarse aquí que después de diez minutos creando una
+# instancia de Cloud SQL.
+AXIUM_LICENSE="${AXIUM_LICENSE:-}"
+LICENSE_FROM_ENV=0; [[ -z "$AXIUM_LICENSE" ]] || LICENSE_FROM_ENV=1
+LICENSE_API="${LICENSE_API:-https://meta.axium-lab.com/v1/license/check}"
 
 QUAY_CORE="quay.io/axiumlab/core"
 QUAY_UI="quay.io/axiumlab/ui"
@@ -145,6 +154,78 @@ read_sa() {
         --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true
 }
 
+# Comprueba una licencia contra la API de Axium Lab. Deja un resumen legible en
+# $LICENSE_INFO y el motivo del rechazo en $LICENSE_ERROR. Devuelve 0 si vale,
+# 1 si la API la rechaza y 2 si no se ha podido preguntar (red, DNS, caída).
+# Esos dos casos se tratan distinto: un rechazo para la instalación, un fallo de
+# red solo avisa, porque el core valida la licencia por su cuenta al arrancar.
+#
+# Aquí NO se verifica la firma del token que devuelve la API: haría falta la
+# clave pública Ed25519 y este no es el sitio donde eso importa. Esto es una
+# comprobación de sanidad para cazar una licencia mal copiada, caducada o
+# revocada antes de empezar a crear cosas.
+LICENSE_INFO=""
+LICENSE_ERROR=""
+check_license() {
+    local key="$1" resp out
+    LICENSE_INFO=""; LICENSE_ERROR=""
+
+    # Sin -f a propósito: el cuerpo de un 400 o un 404 trae el motivo, que es
+    # justo lo que hay que enseñar. El código http se pega al final para poder
+    # distinguir "la API dice que no" de "no hay API".
+    resp="$(curl -sS --max-time 20 -w '\n%{http_code}' "${LICENSE_API}/${key}" 2>/dev/null || printf '\n000')"
+
+    out="$(printf '%s' "$resp" | python3 -c '
+import base64, json, sys
+
+body, _, code = sys.stdin.read().rpartition("\n")
+
+def bail(kind, msg):
+    print("%s|%s" % (kind, msg))
+    sys.exit(0)
+
+if code == "000" or not body.strip():
+    bail("NET", "no responde %s (http %s)" % (sys.argv[1], code or "?"))
+try:
+    d = json.loads(body)
+except Exception:
+    bail("NET", "respuesta ilegible de la API de licencias (http %s)" % code)
+
+if not d.get("status"):
+    err = d.get("error") or {}
+    det = "; ".join(x.get("message", "") for x in (err.get("details") or [])
+                    if isinstance(x, dict))
+    bail("ERR", "%s%s" % (err.get("message") or "licencia rechazada",
+                          " (%s)" % det if det else ""))
+
+tok = (d.get("data") or {}).get("license") or ""
+parts = tok.split(".")
+if len(parts) != 3:
+    bail("NET", "la API no ha devuelto un token de licencia")
+pad = parts[1] + "=" * (-len(parts[1]) % 4)
+try:
+    c = json.loads(base64.urlsafe_b64decode(pad))
+except Exception:
+    bail("NET", "no se ha podido leer el token de licencia")
+
+if not c.get("valid") or c.get("revoked_at"):
+    bail("ERR", "la licencia consta como %s" % (c.get("state") or "no válida"))
+
+print("OK|%s | %s %s | caduca %s" % (
+    c.get("customer_name") or "sin titular",
+    c.get("product") or "?", c.get("type") or "?",
+    (c.get("expires_at") or "nunca")[:10]))
+' "$LICENSE_API" 2>/dev/null)"
+
+    case "$out" in
+        OK\|*)  LICENSE_INFO="${out#OK|}"; return 0 ;;
+        ERR\|*) LICENSE_ERROR="${out#ERR|}"; return 1 ;;
+        *)      LICENSE_ERROR="${out#NET|}"
+                LICENSE_ERROR="${LICENSE_ERROR:-fallo comprobando la licencia}"
+                return 2 ;;
+    esac
+}
+
 [[ -n "$PROJECT_ID" ]] || die "No hay proyecto configurado. Ejecuta: gcloud config set project TU_PROYECTO"
 
 log "Axium en GCP"
@@ -153,12 +234,69 @@ info "región:   $REGION"
 info "versión:  $TAG"
 [[ "$VERTEX_PROJECT" != "$PROJECT_ID" ]] && info "vertex:   $VERTEX_PROJECT"
 
-# //// 1. APIS Y ARTIFACT REGISTRY \\\\
+# //// 1. LICENCIA \\\\
+# read_env necesita la API de Cloud Run habilitada, cosa que todavía no se ha
+# hecho. No es problema: si esa API no está activa tampoco hay ningún core
+# desplegado del que leer, así que devuelve vacío y se acaba preguntando, que es
+# lo correcto en una instalación nueva.
+log "Licencia"
+if (( LICENSE_FROM_ENV )); then
+    info "usando la licencia de la variable de entorno"
+else
+    AXIUM_LICENSE="$(read_env "$CORE_SERVICE" AXIUM_LICENSE)"
+    [[ -z "$AXIUM_LICENSE" ]] || info "reutilizando la licencia del core ya desplegado"
+fi
+
+for attempt in 1 2 3; do
+    if [[ -z "$AXIUM_LICENSE" ]]; then
+        info "Introduce tu licencia de Axium (40 caracteres hexadecimales):"
+        read -rp "    Licencia: " AXIUM_LICENSE
+        # Un copiar y pegar arrastra espacios y saltos con una facilidad pasmosa,
+        # y la API exige 40 hex clavados.
+        AXIUM_LICENSE="$(printf '%s' "$AXIUM_LICENSE" | tr -d '[:space:]')"
+    fi
+
+    if [[ -z "$AXIUM_LICENSE" ]]; then
+        # Preguntar a la API por una cadena vacía responde 'Route not found', que
+        # no le dice nada a nadie. Se trata como un rechazo más y se repregunta.
+        rc=1; LICENSE_ERROR="no has escrito ninguna licencia"
+    else
+        # set +e: check_license usa 1 y 2 como información, no como error, y hay
+        # que poder distinguirlos.
+        set +e; check_license "$AXIUM_LICENSE"; rc=$?; set -e
+    fi
+
+    if (( rc == 0 )); then
+        info "licencia válida: $LICENSE_INFO"
+        break
+    fi
+    if (( rc == 2 )); then
+        warn "no se ha podido comprobar la licencia: $LICENSE_ERROR
+    Sigo adelante con la instalación. El core la vuelve a validar al arrancar,
+    así que si no sirve se verá ahí."
+        break
+    fi
+
+    # Rechazo explícito de la API. Con la licencia en el entorno no se pregunta:
+    # quien la pasa así lo hace desde un pipeline, y esperar por un prompt que no
+    # va a contestar nadie es peor que fallar.
+    if (( LICENSE_FROM_ENV )); then
+        die "La licencia de AXIUM_LICENSE no es válida: $LICENSE_ERROR"
+    fi
+    warn "licencia no válida: $LICENSE_ERROR"
+    AXIUM_LICENSE=""
+    (( attempt < 3 )) || die "Tres intentos y ninguna licencia válida.
+    Si crees que la tuya debería funcionar, escribe a soporte con la respuesta de:
+      curl -s ${LICENSE_API}/TU_LICENCIA"
+done
+
+# //// 2. APIS Y ARTIFACT REGISTRY \\\\
 log "Habilitando APIs (puede tardar un minuto)"
 gcloud services enable \
     sqladmin.googleapis.com \
     run.googleapis.com \
     artifactregistry.googleapis.com \
+    storage.googleapis.com \
     --project "$PROJECT_ID"
 
 # Vertex AI: el core la llama en caliente para generar con los modelos de
@@ -182,7 +320,7 @@ else
 fi
 gcloud auth configure-docker "$AR_HOST" --quiet
 
-# //// 2. COPIAR LAS IMÁGENES DE QUAY \\\\
+# //// 3. COPIAR LAS IMÁGENES DE QUAY \\\\
 # Cloud Run solo despliega desde Artifact Registry: no puede tirar de quay.io ni
 # de ningún otro registry de terceros. Por eso hay que copiarlas.
 #
@@ -269,7 +407,7 @@ for pair in "${QUAY_CORE}:${TAG} ${CORE_IMAGE}" "${QUAY_UI}:${TAG} ${UI_IMAGE}";
     fi
 done
 
-# //// 3. CLOUD SQL \\\\
+# //// 4. CLOUD SQL \\\\
 # La configuración más barata que admite Cloud SQL: vCPU compartida, disco HDD
 # de 10 GB, una sola zona y sin backups automáticos. Es una instalación de
 # piloto: para producción de verdad, quita --no-backup.
@@ -299,7 +437,7 @@ fi
 CONN="$(gcloud sql instances describe "$DB_INSTANCE" --project "$PROJECT_ID" --format='value(connectionName)')"
 info "connectionName: $CONN"
 
-# //// 4. GENERACIÓN DE SECRETOS \\\\
+# //// 5. GENERACIÓN DE SECRETOS \\\\
 # Se leen primero del servicio ya desplegado. La clave maestra NO SE REGENERA
 # NUNCA si ya existe: cifra las credenciales de proveedor guardadas en la base y
 # cambiarla las dejaría todas ilegibles para siempre. Igual con el DSN, que es
@@ -338,7 +476,7 @@ else
     DATABASE_URL="postgresql://${DB_USER}:${DB_PASS}@localhost/${DB_NAME}?host=/cloudsql/${CONN}"
 fi
 
-# //// 5. PERMISOS \\\\
+# //// 6. PERMISOS \\\\
 log "Permisos del service account de ejecución"
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"
 DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
@@ -348,11 +486,31 @@ RUNTIME_SA="$(read_sa "$CORE_SERVICE")"
 RUNTIME_SA="${RUNTIME_SA:-$DEFAULT_SA}"
 info "service account: $RUNTIME_SA"
 
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member="serviceAccount:${RUNTIME_SA}" \
-    --role="roles/cloudsql.client" \
-    --condition=None >/dev/null
-info "$RUNTIME_SA -> roles/cloudsql.client (en $PROJECT_ID)"
+# Los tres roles que necesita en el proyecto de despliegue:
+#
+#   cloudsql.client       conectar con la instancia por el socket de /cloudsql.
+#   storage.objectUser    leer, escribir y borrar objetos. Es el mínimo que
+#                         permite trabajar con ficheros: objectViewer se queda
+#                         corto en cuanto hay una subida, y objectAdmin da de
+#                         más (setIamPolicy sobre cada objeto, que no hace falta).
+#   storage.bucketViewer  listar buckets y leer sus metadatos. Va aparte porque
+#                         objectUser NO incluye storage.buckets.get, y sin él un
+#                         bucket.exists() de la librería de Node responde 403
+#                         aunque los objetos funcionen. Es de solo lectura: no
+#                         deja crear, configurar ni borrar buckets.
+#
+# Los de Storage van a nivel de proyecto, así el core ve todos los buckets sin
+# tener que volver aquí cada vez que aparezca uno nuevo. Para acotarlo a buckets
+# concretos, se quitan de esta lista y se dan uno a uno:
+#   gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+#     --member="serviceAccount:${RUNTIME_SA}" --role=roles/storage.objectUser
+for role in roles/cloudsql.client roles/storage.objectUser roles/storage.bucketViewer; do
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+        --member="serviceAccount:${RUNTIME_SA}" \
+        --role="$role" \
+        --condition=None >/dev/null
+    info "$RUNTIME_SA -> $role (en $PROJECT_ID)"
+done
 
 # Vertex AI. Sin esto el despliegue va bien y es al usar un modelo de Google
 # cuando salta el 403:
@@ -387,7 +545,7 @@ else
         --role=roles/aiplatform.user --condition=None"
 fi
 
-# //// 6. DESPLEGAR EL CORE \\\\
+# //// 7. DESPLEGAR EL CORE \\\\
 # TRUST_PROXY=true porque Cloud Run termina el TLS por delante y reescribe
 # siempre las cabeceras X-Forwarded-*. PORT lo inyecta Cloud Run y NODE_ENV ya
 # viene en la imagen, así que no se pasan. Memoria y concurrencia salen del
@@ -399,7 +557,7 @@ if ! gcloud run deploy "$CORE_SERVICE" \
     --region "$REGION" \
     --allow-unauthenticated \
     --add-cloudsql-instances "$CONN" \
-    --set-env-vars "DATABASE_URL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true" \
+    --set-env-vars "DATABASE_URL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true,AXIUM_LICENSE=${AXIUM_LICENSE}" \
     --memory 1Gi --cpu 1 --concurrency 20 \
     --min-instances 0 --max-instances 4; then
     die "Falló el despliegue del core.
@@ -412,7 +570,7 @@ fi
 CORE_URL="$(gcloud run services describe "$CORE_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')"
 info "core: $CORE_URL"
 
-# //// 7. DESPLEGAR LA UI \\\\
+# //// 8. DESPLEGAR LA UI \\\\
 # API_URL la resuelve el NAVEGADOR del usuario, no el contenedor: tiene que ser
 # una URL pública. La de Cloud Run del core lo es y además es https, así que no
 # hay contenido mixto. Por eso el core va primero.
@@ -428,7 +586,7 @@ gcloud run deploy "$UI_SERVICE" \
 
 UI_URL="$(gcloud run services describe "$UI_SERVICE" --project "$PROJECT_ID" --region "$REGION" --format='value(status.url)')"
 
-# //// 8. COMPROBACIÓN \\\\
+# //// 9. COMPROBACIÓN \\\\
 # La primera petición provoca el arranque en frío, y con él la instalación del
 # esquema. Después hay que mirar install/status y no health: health responde ok
 # aunque la instalación haya fallado, así que es el único que distingue una
@@ -486,7 +644,18 @@ Antes de cualquier otra cosa:
      Cifra las credenciales de proveedor guardadas en la base de datos y NO SE
      PUEDE ROTAR: si se pierde, hay que volver a introducirlas todas a mano.
 
-Dos cosas que conviene saber:
+Unas cuantas cosas que conviene saber:
+
+  - La licencia (${LICENSE_INFO:-sin comprobar}) viaja en la variable
+    AXIUM_LICENSE del servicio $CORE_SERVICE. Cuando la renueves no hace falta
+    reinstalar nada:
+
+      gcloud run services update $CORE_SERVICE --region $REGION \\
+        --update-env-vars AXIUM_LICENSE=la-nueva
+
+  - El core puede leer y escribir objetos en TODOS los buckets de $PROJECT_ID
+    (storage.objectUser y storage.bucketViewer sobre el proyecto). No puede
+    crear ni borrar buckets, ni cambiar sus permisos.
 
   - La clave maestra y la contraseña de la base están en claro en la
     configuración del servicio de Cloud Run, así que las ve cualquiera con
