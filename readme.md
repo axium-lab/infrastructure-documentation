@@ -154,9 +154,17 @@ The containers are disposable and the Postgres volume stays where it is. Same fo
 ### On Google Cloud
 
 Use `infra-gcp/update.sh`. It asks what you want to upgrade —core, ui or both—, copies the
-image from Quay into Artifact Registry and redeploys the Cloud Run services. It only passes
-`--image`, so the database, the master key, the environment variables and the IAM policy stay
-exactly as they were.
+image from Quay into Artifact Registry and redeploys the Cloud Run services. The deploy only
+passes `--image`, so the database, the master key and the environment variables stay exactly
+as they were.
+
+When the core is part of the upgrade it also re-applies the APIs and IAM roles that the core
+needs to run —Cloud SQL, Cloud Storage and Vertex AI—, the same ones `infra-gcp/gcp.sh`
+grants. An installation created by an older version of the installer does not have them, and
+without them the new core starts but answers 403 as soon as it touches a bucket or a Google
+model. Every binding is idempotent, so repeating them changes nothing, and none of them
+aborts the upgrade: if you have no IAM permission on the project the script warns and prints
+the command whoever does can run. Use `SKIP_IAM=1` to skip that step altogether.
 
 ```bash
 bash infra-gcp/update.sh                 # asks what to upgrade
@@ -167,7 +175,8 @@ TAG=v0.2.0 bash infra-gcp/update.sh both # both, on a specific version (recommen
 
 It expects an installation that is already running: if a service or the Artifact Registry
 repository is missing, it stops and points you at `infra-gcp/gcp.sh`. Add `DEBUG=1` for
-network diagnostics, and `REGION=` if you did not deploy to `europe-west1`.
+network diagnostics, `REGION=` if you did not deploy to `europe-west1`, and
+`VERTEX_PROJECT=` if Vertex AI lives in another project.
 
 ## Three things worth knowing beforehand
 

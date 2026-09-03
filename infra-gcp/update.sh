@@ -3,8 +3,15 @@
 # la de la ui o las dos, y redespliega los servicios de Cloud Run
 # correspondientes. Pregunta qué actualizar si no se le dice.
 #
-# No toca la base de datos, ni los secretos, ni los permisos. Para una
-# instalación desde cero (o si algo de eso falta) usa gcp.sh.
+# Cuando se actualiza el core repasa además las APIs y los permisos que necesita
+# para funcionar —Cloud SQL, Cloud Storage y Vertex AI—. Son los mismos que
+# concede gcp.sh y se vuelven a aplicar aquí porque una instalación hecha con una
+# versión anterior del instalador no los tiene: sin ellos, la versión nueva del
+# core arranca pero responde 403 en cuanto toca un bucket o un modelo de Google.
+# Todos los bindings son idempotentes, así que repetirlos no cambia nada.
+#
+# No toca la base de datos ni los secretos. Para una instalación desde cero (o si
+# falta alguna pieza) usa gcp.sh.
 #
 #   bash update.sh                        # pregunta qué actualizar
 #   bash update.sh core                   # solo el core, sin preguntar
@@ -12,6 +19,8 @@
 #   TAG=v0.2.0 bash update.sh both        # ambos, en una versión concreta (recomendado)
 #   REGION=europe-southwest1 bash update.sh
 #   DEBUG=1 bash update.sh                # diagnóstico de red y crane en verbose
+#   VERTEX_PROJECT=otro bash update.sh    # si Vertex AI vive en otro proyecto
+#   SKIP_IAM=1 bash update.sh             # no tocar APIs ni permisos
 set -euo pipefail
 
 # //// CONFIGURACIÓN \\\\
@@ -25,6 +34,17 @@ AR_REPO="${AR_REPO:-axium}"
 CORE_SERVICE="${CORE_SERVICE:-axium-core}"
 UI_SERVICE="${UI_SERVICE:-axium-ui}"
 
+# Proyecto donde vive Vertex AI. Por defecto el mismo del despliegue, que es el
+# caso normal. Se separa porque el core llama a Vertex con el project_id que
+# tenga configurado el proveedor DENTRO de Axium, y ese puede ser otro: el rol
+# va siempre en el proyecto de Vertex, con la SA del core como member.
+#   VERTEX_PROJECT=otro-proyecto bash update.sh
+VERTEX_PROJECT="${VERTEX_PROJECT:-$PROJECT_ID}"
+
+# Para quien actualiza sin permisos de IAM y sabe que los bindings ya están
+# puestos: se salta el repaso de APIs y roles y solo redespliega.
+SKIP_IAM="${SKIP_IAM:-}"
+
 QUAY_CORE="quay.io/axiumlab/core"
 QUAY_UI="quay.io/axiumlab/ui"
 AR_HOST="${REGION}-docker.pkg.dev"
@@ -37,6 +57,16 @@ die()  { printf '\n\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # tr y no ${var,,}: el bash 3.2 de macOS no conoce esa expansión.
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# La service account con la que corre un servicio de Cloud Run ya desplegado.
+# Sale vacío si se desplegó sin --service-account, que es lo que hace gcp.sh: en
+# ese caso Cloud Run usa la SA de compute por defecto. Se lee de vuelta en lugar
+# de suponerla porque, si alguien la cambió a mano, los permisos tienen que ir a
+# LA SUYA y no a la que el script daría por hecha.
+read_sa() {
+    gcloud run services describe "$1" --project "$PROJECT_ID" --region "$REGION" \
+        --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true
+}
 
 # //// QUÉ SE ACTUALIZA \\\\
 # Se admite por argumento o por variable de entorno para poder lanzarlo sin
@@ -178,6 +208,7 @@ log "Actualizando $WHAT de Axium"
 info "proyecto: $PROJECT_ID"
 info "región:   $REGION"
 info "versión:  $TAG"
+[[ "$VERTEX_PROJECT" == "$PROJECT_ID" ]] || info "vertex:   $VERTEX_PROJECT"
 
 # //// 1. COMPROBACIONES PREVIAS \\\\
 # Esto es una actualización, no una instalación: si falta cualquiera de las
@@ -205,7 +236,116 @@ info "el repositorio '$AR_REPO' existe"
 
 gcloud auth configure-docker "$AR_HOST" --quiet
 
-# //// 2. TRAER LAS IMÁGENES DE QUAY \\\\
+# //// 2. APIS Y PERMISOS DEL CORE \\\\
+# Solo con el core: la ui no habla ni con Cloud SQL, ni con Storage, ni con
+# Vertex AI, así que actualizarla sola no tiene por qué tocar IAM.
+#
+# Nada de esto aborta el script. Es una actualización de una instalación que ya
+# funciona, y quien la lanza puede perfectamente no mandar en la política de IAM
+# del proyecto: en ese caso vale más redesplegar la imagen nueva y avisar de qué
+# comando falta que quedarse sin actualizar.
+if (( UPDATE_CORE )) && [[ -z "$SKIP_IAM" ]]; then
+    log "APIs y permisos del core"
+
+    # storage: el core lee y escribe objetos. En una instalación creada con una
+    # versión anterior de gcp.sh puede no estar habilitada.
+    if ! gcloud services enable storage.googleapis.com --project "$PROJECT_ID" 2>/dev/null; then
+        warn "no se ha podido habilitar storage.googleapis.com en '$PROJECT_ID'.
+    Los ficheros fallarán hasta que se habilite:
+      gcloud services enable storage.googleapis.com --project $PROJECT_ID"
+    fi
+
+    # Vertex AI va aparte porque puede vivir en otro proyecto.
+    if ! gcloud services enable aiplatform.googleapis.com --project "$VERTEX_PROJECT" 2>/dev/null; then
+        warn "no se ha podido habilitar aiplatform.googleapis.com en '$VERTEX_PROJECT'.
+    Los modelos de Google (Gemini) fallarán hasta que se habilite:
+      gcloud services enable aiplatform.googleapis.com --project $VERTEX_PROJECT"
+    fi
+
+    # Si el core se desplegó con una SA propia, los permisos van a esa. Si no, a
+    # la de compute por defecto, que es la que le puso gcp.sh. El número de
+    # proyecto solo se pide en ese segundo caso, y su fallo no mata el script:
+    # sin él no se sabe a quién dar los roles, así que se avisa y se sigue con el
+    # redespliegue, que es lo que de verdad se ha venido a hacer aquí.
+    RUNTIME_SA="$(read_sa "$CORE_SERVICE")"
+    if [[ -z "$RUNTIME_SA" ]]; then
+        PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)' 2>/dev/null || true)"
+        [[ -z "$PROJECT_NUMBER" ]] || RUNTIME_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+    fi
+
+    if [[ -z "$RUNTIME_SA" ]]; then
+        warn "no se ha podido averiguar con qué service account corre '$CORE_SERVICE'.
+    Los permisos de Cloud SQL, Storage y Vertex AI se quedan como estén. Míralos
+    con:
+      gcloud run services describe $CORE_SERVICE --region $REGION --project $PROJECT_ID"
+    else
+        info "service account: $RUNTIME_SA"
+
+        # Los tres roles que necesita en el proyecto de despliegue:
+        #
+        #   cloudsql.client       conectar con la instancia por el socket de /cloudsql.
+        #   storage.objectUser    leer, escribir y borrar objetos. Es el mínimo que
+        #                         permite trabajar con ficheros: objectViewer se queda
+        #                         corto en cuanto hay una subida, y objectAdmin da de
+        #                         más (setIamPolicy sobre cada objeto, que no hace
+        #                         falta).
+        #   storage.bucketViewer  listar buckets y leer sus metadatos. Va aparte porque
+        #                         objectUser NO incluye storage.buckets.get, y sin él
+        #                         un bucket.exists() de la librería de Node responde
+        #                         403 aunque los objetos funcionen. Es de solo lectura:
+        #                         no deja crear, configurar ni borrar buckets.
+        #
+        # Los de Storage van a nivel de proyecto, así el core ve todos los buckets sin
+        # tener que volver aquí cada vez que aparezca uno nuevo. Para acotarlo a
+        # buckets concretos, se quitan de esta lista y se dan uno a uno:
+        #   gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+        #     --member="serviceAccount:${RUNTIME_SA}" --role=roles/storage.objectUser
+        for role in roles/cloudsql.client roles/storage.objectUser roles/storage.bucketViewer; do
+            if gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+                --member="serviceAccount:${RUNTIME_SA}" \
+                --role="$role" \
+                --condition=None >/dev/null 2>&1; then
+                info "$RUNTIME_SA -> $role (en $PROJECT_ID)"
+            else
+                warn "no se ha podido dar $role en el proyecto '$PROJECT_ID'.
+    Hace falta permiso de IAM sobre el proyecto. Quien lo tenga puede ejecutar:
+
+      gcloud projects add-iam-policy-binding $PROJECT_ID \\
+        --member=\"serviceAccount:${RUNTIME_SA}\" \\
+        --role=$role --condition=None"
+            fi
+        done
+
+        # Vertex AI. Sin esto el redespliegue va bien y es al usar un modelo de
+        # Google cuando salta el 403:
+        #
+        #   Permission 'aiplatform.endpoints.predict' denied on resource
+        #   '//aiplatform.googleapis.com/projects/.../publishers/google/models/...'
+        #   reason: IAM_PERMISSION_DENIED
+        #
+        # El binding es A NIVEL DE PROYECTO a propósito. Los publisher models
+        # (publishers/google/models/...) no admiten política de IAM por recurso, así
+        # que no se puede acotar más por aquí.
+        if gcloud projects add-iam-policy-binding "$VERTEX_PROJECT" \
+            --member="serviceAccount:${RUNTIME_SA}" \
+            --role="roles/aiplatform.user" \
+            --condition=None >/dev/null 2>&1; then
+            info "$RUNTIME_SA -> roles/aiplatform.user (en $VERTEX_PROJECT)"
+        else
+            warn "no se ha podido dar roles/aiplatform.user en el proyecto '$VERTEX_PROJECT'.
+    Los modelos de Google (Gemini) responderán 403 PERMISSION_DENIED hasta que
+    alguien con permisos de IAM en ese proyecto ejecute:
+
+      gcloud projects add-iam-policy-binding $VERTEX_PROJECT \\
+        --member=\"serviceAccount:${RUNTIME_SA}\" \\
+        --role=roles/aiplatform.user --condition=None"
+        fi
+    fi
+elif (( UPDATE_CORE )); then
+    info "SKIP_IAM: no se repasan ni las APIs ni los permisos"
+fi
+
+# //// 3. TRAER LAS IMÁGENES DE QUAY \\\\
 # Cloud Run solo despliega desde Artifact Registry: no puede tirar de quay.io ni
 # de ningún otro registry de terceros. Por eso hay que copiarlas.
 #
@@ -333,7 +473,7 @@ CORE_DIGEST=""; UI_DIGEST=""
 if (( UPDATE_CORE )); then fetch "$QUAY_CORE" "$AR_CORE"; CORE_DIGEST="$COPIED_DIGEST"; fi
 if (( UPDATE_UI ));   then fetch "$QUAY_UI"   "$AR_UI";   UI_DIGEST="$COPIED_DIGEST";   fi
 
-# //// 3. REDESPLEGAR \\\\
+# //// 4. REDESPLEGAR \\\\
 # Solo --image, a propósito. Un 'gcloud run deploy' sobre un servicio que ya
 # existe conserva todo lo que no se le pasa: variables de entorno, la instancia
 # de Cloud SQL adjunta, memoria, concurrencia y la política IAM. Así este script
@@ -369,7 +509,7 @@ if (( UPDATE_UI )); then
     info "ui: $UI_URL"
 fi
 
-# //// 4. COMPROBACIÓN \\\\
+# //// 5. COMPROBACIÓN \\\\
 log "Comprobando el despliegue"
 
 # Espera al arranque en frío de la revisión nueva. Devuelve no-cero si no
@@ -460,8 +600,18 @@ reciente, actualízalo también:
 RESUMEN
 fi
 
+if (( UPDATE_CORE )) && [[ -z "$SKIP_IAM" ]]; then
+    cat <<RESUMEN
+El core puede leer y escribir objetos en TODOS los buckets de $PROJECT_ID
+(storage.objectUser y storage.bucketViewer sobre el proyecto), conectar con
+Cloud SQL y llamar a Vertex AI en $VERTEX_PROJECT. No puede crear ni borrar
+buckets, ni cambiar sus permisos.
+
+RESUMEN
+fi
+
 cat <<'RESUMEN'
-Ni la base de datos, ni la clave maestra, ni los permisos se han tocado. Si
-falta algo de eso —o quieres instalar desde cero— usa gcp.sh.
+Ni la base de datos ni la clave maestra se han tocado. Si falta alguna pieza
+—o quieres instalar desde cero— usa gcp.sh.
 
 RESUMEN
