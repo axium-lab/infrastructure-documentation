@@ -1,0 +1,8 @@
+{
+  "type": "module",
+  "dependencies": {
+    "@axium-lab/helix": "^0.2.0",
+    "@google/genai": "^2.17.0",
+    "openai": "^7.4.0"
+  }
+}
