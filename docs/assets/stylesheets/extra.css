@@ -1,0 +1,59 @@
+:root {
+  --md-primary-fg-color: #1f2a44;
+  --md-primary-fg-color--light: #3b4a6b;
+  --md-primary-fg-color--dark: #141c30;
+  --md-accent-fg-color: #ff6a3d;
+  --md-accent-fg-color--transparent: rgba(255, 106, 61, 0.1);
+  --md-typeset-a-color: #c2410c;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #141c30;
+  --md-primary-fg-color--light: #3b4a6b;
+  --md-primary-fg-color--dark: #0b1020;
+  --md-accent-fg-color: #ff8a65;
+  --md-default-bg-color: #0f1526;
+  --md-code-bg-color: #161e33;
+  --md-typeset-a-color: #ff8a65;
+}
+
+.md-header, .md-tabs {
+  background-color: var(--md-primary-fg-color);
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) code {
+  white-space: nowrap;
+}
+
+/* Landing page grid cards */
+.md-typeset .grid.cards > ul > li {
+  border-radius: 0.5rem;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--md-accent-fg-color);
+}
+
+/* Tag chips for required/optional */
+.pill {
+  display: inline-block;
+  padding: 0 0.45em;
+  border-radius: 999px;
+  font-size: 0.65rem;
+  font-weight: 600;
+  line-height: 1.6;
+  vertical-align: middle;
+}
+.pill-required { background: rgba(255, 106, 61, 0.15); color: #c2410c; }
+.pill-optional { background: rgba(59, 130, 246, 0.15); color: #1d4ed8; }
+[data-md-color-scheme="slate"] .pill-required { color: #fdba74; }
+[data-md-color-scheme="slate"] .pill-optional { color: #93c5fd; }

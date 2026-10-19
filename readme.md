@@ -1,5 +1,8 @@
 # Installing Axium
 
+> Full technical documentation —configuration, observability, API, operations— at
+> **<https://doc.axium-lab.com/>**.
+
 Axium is three pieces: **core** (the API), **ui** (the web console) and **PostgreSQL**. This
 guide is the minimum needed to bring them up with Docker and log in for the first time.
 
@@ -98,7 +101,9 @@ isn't 64 hexadecimal characters— the process refuses to start. Everything else
 | `AXIUM_LICENSE`   | —           | Your Axium license, a 40-character hex string. Check it with `curl https://meta.axium-lab.com/v1/license/check/<license>`. `infra-gcp/gcp.sh` asks for it and sets it for you. |
 
 On the first startup the core waits for Postgres (up to 30 seconds), installs the schema
-itself and creates the initial user. Restarting it repeats nothing.
+itself and creates the initial user. Restarting it repeats nothing. On later startups it
+compares the schema version in the database with the one the image ships and, if the
+database is older, migrates it forward automatically (see [Upgrading](#6-upgrading)).
 
 ### Ui
 
@@ -151,6 +156,10 @@ docker stop axium-core && docker rm axium-core
 
 The containers are disposable and the Postgres volume stays where it is. Same for the ui.
 
+Upgrade the core before the ui, and **take a database backup first**: if the new version
+ships a newer schema, the core migrates the database at startup, one version at a time,
+and that migration only goes forward.
+
 ### On Google Cloud
 
 Use `infra-gcp/update.sh`. It asks what you want to upgrade —core, ui or both—, copies the
@@ -183,9 +192,11 @@ network diagnostics, `REGION=` if you did not deploy to `europe-west1`, and
 - **The master key cannot be rotated.** `MASTER_ENCRYPTION_KEY` encrypts the provider
   credentials stored in the database. If it is lost or changed, none of them can be
   decrypted and they all have to be entered again by hand.
-- **There are no schema migrations.** The core installs the schema if the database is empty
-  and touches nothing if it already exists, whatever version it is. Upgrading the image over
-  a database from an earlier version does not upgrade the schema: ask us before moving up a
-  major version.
+- **Schema migrations run automatically, and only forward.** When the core starts on a
+  database from an earlier version it applies the bundled migrations itself; `GET
+  /v1/install/status` shows the resulting version. An older image refuses to start on a
+  database that a newer one has already migrated, so rolling back an image after a migration
+  means restoring the database backup. Back up before upgrading, and ask us before moving up
+  a major version.
 - **If you serve the ui over HTTPS, `API_URL` has to be `https://`.** The browser blocks
   requests to `http://` from an `https` page without giving a clear network error.
