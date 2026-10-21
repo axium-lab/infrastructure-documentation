@@ -550,6 +550,10 @@ fi
 # siempre las cabeceras X-Forwarded-*. PORT lo inyecta Cloud Run y NODE_ENV ya
 # viene en la imagen, así que no se pasan. Memoria y concurrencia salen del
 # techo de subida (50 MB por petición, que se sostienen en RAM).
+#
+# La telemetría va a Postgres, a la MISMA base que el resto: OBSERVABILITY_TYPE
+# y OBSERVABILITY_DB_POSTGRESQL llevan el mismo DSN que DATABASE_URL, y el core
+# crea el esquema telemetry en ella al arrancar.
 log "Desplegando $CORE_SERVICE"
 if ! gcloud run deploy "$CORE_SERVICE" \
     --project "$PROJECT_ID" \
@@ -557,7 +561,7 @@ if ! gcloud run deploy "$CORE_SERVICE" \
     --region "$REGION" \
     --allow-unauthenticated \
     --add-cloudsql-instances "$CONN" \
-    --set-env-vars "DATABASE_URL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true,AXIUM_LICENSE=${AXIUM_LICENSE}" \
+    --set-env-vars "DATABASE_URL=${DATABASE_URL},OBSERVABILITY_TYPE=postgres,OBSERVABILITY_DB_POSTGRESQL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true,AXIUM_LICENSE=${AXIUM_LICENSE}" \
     --memory 1Gi --cpu 1 --concurrency 20 \
     --min-instances 0 --max-instances 4; then
     die "Falló el despliegue del core.

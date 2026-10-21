@@ -183,6 +183,42 @@ read_sa() {
         --format='value(spec.template.spec.serviceAccountName)' 2>/dev/null || true
 }
 
+# La contraseña del usuario de la base no se puede leer de Cloud SQL, pero sí
+# del DATABASE_URL de cualquier core YA DESPLEGADO contra la misma instancia con
+# el mismo usuario: todos los entornos la comparten. Imprime "servicio
+# contraseña" del primero que encaje, o nada. Se lee el listado entero de una
+# vez (trae el spec completo) en lugar de un describe por servicio, y se mira el
+# DSN y no el nombre: así da igual cómo se llame el core del otro entorno.
+#
+# La contraseña se devuelve tal cual está en el DSN, sin decodificar: lo que
+# funciona en ese core funciona en este copiándolo igual.
+find_db_pass() {
+    gcloud run services list --project "$PROJECT_ID" --region "$REGION" --format=json 2>/dev/null \
+        | python3 -c '
+import json, sys
+from urllib.parse import urlsplit, parse_qs
+user, conn = sys.argv[1], sys.argv[2]
+try:
+    svcs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for s in svcs:
+    name = s.get("metadata", {}).get("name", "")
+    cs = s.get("spec", {}).get("template", {}).get("spec", {}).get("containers") or [{}]
+    url = next((e.get("value", "") for e in (cs[0].get("env") or []) if e.get("name") == "DATABASE_URL"), "")
+    if not url:
+        continue
+    try:
+        u = urlsplit(url)
+        host = parse_qs(u.query).get("host", [""])[0]
+    except Exception:
+        continue
+    if u.username == user and host == "/cloudsql/" + conn and u.password:
+        print("%s %s" % (name, u.password))
+        break
+' "$DB_USER" "$CONN" 2>/dev/null || true
+}
+
 # Comprueba una licencia contra la API de Axium Lab. Deja un resumen legible en
 # $LICENSE_INFO y el motivo del rechazo en $LICENSE_ERROR. Devuelve 0 si vale,
 # 1 si la API la rechaza y 2 si no se ha podido preguntar (red, DNS, caída).
@@ -479,6 +515,11 @@ info "connectionName: $CONN"
 # NUNCA si ya existe: cifra las credenciales de proveedor guardadas en la base y
 # cambiarla las dejaría todas ilegibles para siempre. Igual con el DSN, que es
 # el que lleva la contraseña de la base dentro.
+#
+# La contraseña de la base es COMÚN a todos los entornos, porque el usuario lo
+# es. En un entorno nuevo no hay servicio del que leerla, así que se busca en
+# los cores de los demás entornos antes de generar una: cambiarla rompería la
+# conexión de todos ellos, que guardan la suya en su propio DATABASE_URL.
 log "Configuración del core"
 DATABASE_URL="$(read_env "$CORE_SERVICE" DATABASE_URL)"
 MASTER_KEY="$(read_env "$CORE_SERVICE" MASTER_ENCRYPTION_KEY)"
@@ -495,20 +536,31 @@ fi
 if [[ -n "$DATABASE_URL" ]]; then
     info "reutilizando la conexión a la base existente"
 else
-    # Hexadecimal a propósito: así no hay nada que percent-encodear en el DSN ni
-    # ninguna coma que rompa el --set-env-vars de gcloud.
-    DB_PASS="$(openssl rand -hex 24)"
+    DB_PASS=""
     if gcloud sql users list --instance="$DB_INSTANCE" --project "$PROJECT_ID" --format='value(name)' | grep -qx "$DB_USER"; then
-        # El usuario es el mismo para todos los entornos, así que esto cambia la
-        # contraseña que ya usan los cores de los OTROS entornos desplegados en
-        # esta instancia. Cada uno guarda la suya en su DATABASE_URL, que se
-        # reutiliza tal cual: hay que actualizarla a mano en esos servicios.
-        warn "el usuario '$DB_USER' ya existe, le pongo una contraseña nueva.
-    Si hay otros entornos desplegados contra '$DB_INSTANCE' con este mismo
-    usuario, su DATABASE_URL se queda con la contraseña antigua y dejarán de
-    conectar hasta que se actualice en cada servicio."
-        gcloud sql users set-password "$DB_USER" --instance="$DB_INSTANCE" --project "$PROJECT_ID" --password="$DB_PASS"
+        # El usuario es el mismo para todos los entornos. Su contraseña está en
+        # el DATABASE_URL de cualquier otro core desplegado contra esta
+        # instancia, y es la que hay que reutilizar.
+        read -r OTHER_CORE DB_PASS <<<"$(find_db_pass)" || true
+        if [[ -n "$DB_PASS" ]]; then
+            info "el usuario '$DB_USER' ya existe, reutilizo la contraseña que usa $OTHER_CORE"
+        else
+            # Sin ningún core del que leerla no queda otra que cambiarla. Es
+            # el caso de una instancia que venga de otro script o de otro
+            # proyecto: si hay servicios conectados que este script no ve,
+            # se quedan con la antigua.
+            warn "el usuario '$DB_USER' ya existe pero no hay ningún core desplegado
+    en '$REGION' del que leer su contraseña, así que le pongo una nueva.
+    Si hay otros servicios conectados a '$DB_INSTANCE' con este usuario, su
+    DATABASE_URL se queda con la contraseña antigua y dejarán de conectar
+    hasta que se actualice en cada uno."
+            DB_PASS="$(openssl rand -hex 24)"
+            gcloud sql users set-password "$DB_USER" --instance="$DB_INSTANCE" --project "$PROJECT_ID" --password="$DB_PASS"
+        fi
     else
+        # Hexadecimal a propósito: así no hay nada que percent-encodear en el
+        # DSN ni ninguna coma que rompa el --set-env-vars de gcloud.
+        DB_PASS="$(openssl rand -hex 24)"
         gcloud sql users create "$DB_USER" --instance="$DB_INSTANCE" --project "$PROJECT_ID" --password="$DB_PASS"
     fi
 
@@ -594,6 +646,10 @@ fi
 # siempre las cabeceras X-Forwarded-*. PORT lo inyecta Cloud Run y NODE_ENV ya
 # viene en la imagen, así que no se pasan. Memoria y concurrencia salen del
 # techo de subida (50 MB por petición, que se sostienen en RAM).
+#
+# La telemetría va a Postgres, a la MISMA base que el resto: OBSERVABILITY_TYPE
+# y OBSERVABILITY_DB_POSTGRESQL llevan el mismo DSN que DATABASE_URL, y el core
+# crea el esquema telemetry en ella al arrancar.
 log "Desplegando $CORE_SERVICE"
 if ! gcloud run deploy "$CORE_SERVICE" \
     --project "$PROJECT_ID" \
@@ -601,7 +657,7 @@ if ! gcloud run deploy "$CORE_SERVICE" \
     --region "$REGION" \
     --allow-unauthenticated \
     --add-cloudsql-instances "$CONN" \
-    --set-env-vars "DATABASE_URL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true,AXIUM_LICENSE=${AXIUM_LICENSE}" \
+    --set-env-vars "DATABASE_URL=${DATABASE_URL},OBSERVABILITY_TYPE=postgres,OBSERVABILITY_DB_POSTGRESQL=${DATABASE_URL},MASTER_ENCRYPTION_KEY=${MASTER_KEY},TRUST_PROXY=true,AXIUM_LICENSE=${AXIUM_LICENSE}" \
     --memory 1Gi --cpu 1 --concurrency 20 \
     --min-instances 0 --max-instances 4; then
     die "Falló el despliegue del core.
@@ -717,9 +773,10 @@ Unas cuantas cosas que conviene saber:
        VERTEX_PROJECT=ese-otro-proyecto AXIUM_ENV=${AXIUM_ENV} bash gcp-environments.sh
 
   - Este despliegue es el entorno '${AXIUM_ENV:-(sin prefijo)}'. La instancia
-    $DB_INSTANCE y el usuario $DB_USER son comunes a todos los entornos; lo
-    propio de este son los servicios $CORE_SERVICE y $UI_SERVICE y la base
-    $DB_NAME. Para otro entorno, vuelve a lanzar el script con otro nombre.
+    $DB_INSTANCE, el usuario $DB_USER y su contraseña son comunes a todos los
+    entornos; lo propio de este son los servicios $CORE_SERVICE y $UI_SERVICE
+    y la base $DB_NAME. Para otro entorno, vuelve a lanzar el script con otro
+    nombre: la contraseña la leerá del core de este.
 
 Para actualizar:  TAG=v0.2.0 AXIUM_ENV=${AXIUM_ENV} bash gcp-environments.sh
 

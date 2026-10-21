@@ -1975,6 +1975,8 @@ run:</p>
 <li>
 <p><strong>Core</strong> on Cloud Run: <code>--allow-unauthenticated</code>, 1 GiB RAM, 1 vCPU,
    concurrency 20, 0 to 4 instances, with <code>DATABASE_URL</code>,
+   <code>OBSERVABILITY_TYPE=postgres</code>, <code>OBSERVABILITY_DB_POSTGRESQL</code> (the same DSN
+   as <code>DATABASE_URL</code>, so telemetry lands in the same database),
    <code>MASTER_ENCRYPTION_KEY</code>, <code>TRUST_PROXY=true</code> and <code>AXIUM_LICENSE</code>. Memory and
    concurrency follow from the 50 MB upload ceiling, which is held in RAM per
    request.</p>
@@ -2019,8 +2021,10 @@ duplicate.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">AXIUM_ENV</span><span class="o">=</span>dev<span class="w"> </span><span class="nv">TAG</span><span class="o">=</span>v0.1.0<span class="w"> </span>bash<span class="w"> </span>gcp-environments.sh<span class="w">   </span><span class="c1"># non-interactive</span>
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">AXIUM_ENV</span><span class="o">=</span><span class="w"> </span>bash<span class="w"> </span>gcp-environments.sh<span class="w">                 </span><span class="c1"># empty = no prefix, same as gcp.sh</span>
 </span></code></pre></div>
-<p>Each environment gets its own master key and its own database user password,
-read back from its own Cloud Run service on re-runs.</p>
+<p>Each environment gets its own master key, read back from its own Cloud Run
+service on re-runs. The database user and its password are shared by every
+environment: a new environment reads the password from any core already
+deployed against the same instance, so adding one never rotates it.</p>
 <h2 id="upgrading">Upgrading<a class="headerlink" href="#upgrading" title="Permanent link">&para;</a></h2>
 <p>Use <code>infra-gcp/update.sh</code>. It is covered in <a href="../../operations/upgrading/#on-google-cloud">Upgrading</a>.</p>
 <h2 id="cost-notes">Cost notes<a class="headerlink" href="#cost-notes" title="Permanent link">&para;</a></h2>
