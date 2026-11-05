@@ -1,3 +1,4 @@
 documentation/.venv/
 .venv/
 .DS_Store
+examples/sdk-js/node_modules/
